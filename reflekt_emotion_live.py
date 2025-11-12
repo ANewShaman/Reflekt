@@ -1,21 +1,15 @@
 """
-Reflekt Emotion Detection Engine - Async Performance Optimized (v2.0)
-======================================================================
-- Non-blocking async emotion analysis (DeepFace runs in background thread)
-- Age detection only on session start (one-time, not per-frame)
-- Optimized frame skipping and smoothing
-- Voice fusion hook ready
-- Optional REST API (/emotion) for front-end
-- JSON / CSV / NDJSON session exports
-
-Performance Improvements:
-    - UI never blocks on DeepFace processing
-    - 60 FPS UI rendering even during analysis
-    - Reduced CPU load with smarter frame submission
-    - Age cached from first successful detection
+Reflekt Emotion Detection Engine - FER Implementation (v2.1, fixed)
+-------------------------------------------------------------------
+- FIX: Convert OpenCV BGR -> RGB before FER detection (critical).
+- FIX: Robust FER import (fallback to fer.fer.FER).
+- FIX: MTCNN availability check + fallback to OpenCV mode.
+- Better face selection (highest-confidence face).
+- Reliable real-time overlay and session logging.
+- JSON / CSV / NDJSON exports.
 
 Requires:
-    pip install deepface opencv-python numpy
+    pip install fer opencv-python numpy
 Optional (for REST API):
     pip install flask
 """
@@ -34,13 +28,20 @@ from typing import Dict, Optional, List, Tuple
 from dataclasses import dataclass, asdict
 from collections import deque
 
-# ---- Import DeepFace with friendly error handling
+# ---- Import FER with friendly error handling and fallbacks
+FER_CLASS = None
 try:
-    from deepface import DeepFace
-except Exception as exc:
-    print("DeepFace not found or failed to import.")
-    print("    Install with:  pip install deepface")
-    raise
+    from fer import FER as _FER
+    FER_CLASS = _FER
+except Exception:
+    try:
+        # Some versions expose the class under fer.fer
+        from fer.fer import FER as _FER
+        FER_CLASS = _FER
+    except Exception:
+        print("FER not found or failed to import.")
+        print("    Install with:  pip install fer")
+        raise
 
 # ============================================================================ #
 # NUMPY TYPE CONVERSION HELPER
@@ -103,17 +104,14 @@ class SessionMetadata:
 
 
 # ============================================================================ #
-# 2) ASYNC EMOTION ENGINE (Non-blocking)
+# 2) ASYNC EMOTION ENGINE (Non-blocking with FER)
 # ============================================================================ #
 
 class AsyncReflektEmotionEngine:
     """
-    Async emotion engine - DeepFace runs in background thread.
-    Main thread never blocks, UI stays smooth at 60 FPS.
-    
-    Usage:
-        engine.submit_frame(frame)  # Non-blocking
-        result = engine.get_latest_result()  # Returns immediately
+    Async emotion engine using FER library.
+    FER runs in background thread, main thread never blocks.
+    UI stays smooth at 60 FPS.
     """
 
     EMOTION_MAPS = {
@@ -130,16 +128,14 @@ class AsyncReflektEmotionEngine:
     def __init__(self, config: dict | None = None):
         # Config defaults
         self.config = {
-            "frame_skip": 10,              # Process every 10th frame
+            "frame_skip": 8,               # Process every Nth frame
             "smoothing_window": 4,         # Moving avg window
-            "min_confidence": 0.30,        # Confidence threshold
-            "backend": "opencv",           # 'opencv' is fastest
-            "enforce_detection": False,    # Don't crash if no face
+            "min_confidence": 0.30,        # Threshold on dominant score (0..1)
             "use_smoothed_output": True,   # Smooth valence/arousal
             "serve_api": False,            # REST API toggle
             "api_port": 5055,              # REST API port
             "fusion_weights": {"face": 0.7, "voice": 0.3},
-            "detect_age_once": True,       # Only detect age at session start
+            "mtcnn": True,                 # Use MTCNN for face detection (more accurate, slower, optional dep)
         }
         if config:
             self.config.update(config)
@@ -153,10 +149,6 @@ class AsyncReflektEmotionEngine:
         )
         self.last_valid_emotion: Optional[EmotionFrame] = None
         self.latest_frame: Optional[EmotionFrame] = None
-        
-        # Age cache (detect once)
-        self.cached_age: Optional[int] = None
-        self.age_detection_attempted: bool = False
 
         # Voice state
         self.voice_last: Optional[Dict[str, float]] = None
@@ -174,33 +166,59 @@ class AsyncReflektEmotionEngine:
         self.start_time: float = time.time()
 
         # Async processing queues
-        self.frame_queue: queue.Queue = queue.Queue(maxsize=2)
+        self.frame_queue: queue.Queue = queue.Queue(maxsize=3)
         self.result_queue: queue.Queue = queue.Queue(maxsize=5)
+        
+        # Initialize FER detector
+        self.detector: Optional[FER_CLASS] = None
+        self._init_detector()
         
         # Worker thread
         self._worker_running = True
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
 
-        # Pre-warm DeepFace in worker thread
+        # Pre-warm FER in worker thread
         self._warmup()
 
+    def _init_detector(self):
+        """Initialize FER detector with error handling and MTCNN availability check."""
+        mtcnn_requested = bool(self.config.get("mtcnn", False))
+        mtcnn_ok = False
+        if mtcnn_requested:
+            try:
+                import mtcnn  # noqa: F401
+                mtcnn_ok = True
+            except Exception:
+                print("! MTCNN requested but not installed. Falling back to OpenCV mode.")
+                mtcnn_ok = False
+
+        try:
+            self.detector = FER_CLASS(mtcnn=mtcnn_requested and mtcnn_ok)
+            self.config["mtcnn"] = (mtcnn_requested and mtcnn_ok)
+            print(f"✓ FER detector initialized (MTCNN: {self.config['mtcnn']})")
+        except Exception as e:
+            print(f"✗ Failed to initialize FER: {e}")
+            print("  Falling back to non-MTCNN (OpenCV) mode...")
+            self.detector = FER_CLASS(mtcnn=False)
+            self.config["mtcnn"] = False
+            print("✓ FER detector initialized (OpenCV mode)")
+
     def _warmup(self):
-        """Pre-warm DeepFace to avoid first-frame latency."""
+        """Pre-warm FER to avoid first-frame latency."""
         def warmup_task():
             try:
-                _ = DeepFace.analyze(
-                    np.zeros((64, 64, 3), dtype=np.uint8),
-                    actions=["emotion"],
-                    enforce_detection=False,
-                    detector_backend=self.config["backend"],
-                    silent=True,
-                )
+                dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+                # Draw a simple face-like pattern to help detector
+                cv2.circle(dummy, (320, 240), 80, (255, 255, 255), -1)
+                if self.detector:
+                    # IMPORTANT: convert to RGB for FER
+                    rgb = cv2.cvtColor(dummy, cv2.COLOR_BGR2RGB)
+                    _ = self.detector.detect_emotions(rgb)
             except Exception:
                 pass
         
-        warmup_thread = threading.Thread(target=warmup_task, daemon=True)
-        warmup_thread.start()
+        threading.Thread(target=warmup_task, daemon=True).start()
 
     # --------------- Background Worker Thread ---------------- #
 
@@ -208,72 +226,82 @@ class AsyncReflektEmotionEngine:
         """Background thread that processes frames from queue."""
         while self._worker_running:
             try:
-                frame = self.frame_queue.get(timeout=0.1)
-                if frame is None:  # Shutdown signal
+                frame_bgr = self.frame_queue.get(timeout=0.15)
+                if frame_bgr is None:  # Shutdown signal
                     break
                 
-                result = self._analyze_frame_blocking(frame)
+                result = self._analyze_frame_blocking(frame_bgr)
                 if result:
                     try:
                         self.result_queue.put_nowait(result)
                     except queue.Full:
-                        # Drop oldest result if queue full
+                        # Keep newest result
                         try:
-                            self.result_queue.get_nowait()
-                            self.result_queue.put_nowait(result)
-                        except:
+                            _ = self.result_queue.get_nowait()
+                        except queue.Empty:
                             pass
-                            
+                        try:
+                            self.result_queue.put_nowait(result)
+                        except queue.Full:
+                            pass
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Worker error: {e}")
                 continue
 
-    def _analyze_frame_blocking(self, frame: np.ndarray) -> Optional[EmotionFrame]:
+    def _pick_face(self, results: List[dict]) -> Optional[dict]:
+        """Pick the best face result: highest dominant probability."""
+        if not results:
+            return None
+        best = None
+        best_score = -1.0
+        for r in results:
+            emos = r.get("emotions", {})
+            if not emos:
+                continue
+            dom, score = max(emos.items(), key=lambda x: float(x[1]))
+            if score > best_score:
+                best = r
+                best_score = float(score)
+        return best
+
+    def _analyze_frame_blocking(self, frame_bgr: np.ndarray) -> Optional[EmotionFrame]:
         """
-        The actual DeepFace analysis (blocking, runs in worker thread).
+        The actual FER analysis (blocking, runs in worker thread).
+        CRITICAL: Convert BGR -> RGB before calling FER.
         """
+        if not self.detector:
+            return self._handle_detection_failure()
+            
         t0 = time.time()
         try:
-            # Determine actions based on age detection strategy
-            actions = ["emotion"]
-            if self.config["detect_age_once"] and not self.age_detection_attempted:
-                actions.append("age")
+            # Convert BGR (OpenCV) -> RGB (FER expects RGB)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+            # FER returns list of detected faces with emotions
+            # Format: [{'box': (x,y,w,h), 'emotions': {'angry': 0.01, ...}}]
+            results = self.detector.detect_emotions(frame_rgb)
+            if not results:
+                return self._handle_detection_failure()
             
-            raw = DeepFace.analyze(
-                frame,
-                actions=actions,
-                enforce_detection=self.config["enforce_detection"],
-                detector_backend=self.config["backend"],
-                silent=True,
-            )
-            
-            res = raw[0] if isinstance(raw, list) else raw
-            emotions = res.get("emotion", {})
-            
+            face_data = self._pick_face(results)
+            if not face_data:
+                return self._handle_detection_failure()
+
+            emotions = face_data.get('emotions', {})
             if not emotions:
                 return self._handle_detection_failure()
 
-            dominant = res.get("dominant_emotion", "neutral")
-            confidence = float(emotions.get(dominant, 0.0))
-            
-            # Age handling: detect once and cache
-            if "age" in actions and not self.age_detection_attempted:
-                age_raw = res.get("age")
-                if age_raw is not None:
-                    self.cached_age = int(age_raw) if isinstance(age_raw, (int, float, np.integer, np.floating)) else None
-                self.age_detection_attempted = True
-            
-            age = self.cached_age
+            # Dominant emotion and confidence (0..1 -> %)
+            dominant, conf01 = max(emotions.items(), key=lambda x: float(x[1]))
+            confidence = float(conf01) * 100.0  # percent
 
-            valence, arousal = self.compute_valence_arousal(emotions)
-            
-            # Vibrancy: arousal^0.8 damped by age
-            if age is not None:
-                vibrancy = round((arousal ** 0.8) * (1 - (min(age, 70) / 100)), 3)
-            else:
-                vibrancy = round(arousal ** 0.8, 3)
+            # Normalize emotion values to 0-100 scale
+            all_emotions = {k: round(float(v) * 100.0, 2) for k, v in emotions.items()}
+
+            valence, arousal = self.compute_valence_arousal(all_emotions)
+            vibrancy = round(arousal ** 0.8, 3)
 
             quality = self._assess_quality(confidence)
 
@@ -284,14 +312,14 @@ class AsyncReflektEmotionEngine:
                 confidence=round(confidence, 2),
                 valence=valence,
                 arousal=arousal,
-                all_emotions={k: round(float(v), 2) for k, v in emotions.items()},
+                all_emotions=all_emotions,
                 quality=quality,
                 processing_time_ms=round((time.time() - t0) * 1000.0, 2),
-                age=age,
+                age=None,
                 vibrancy=vibrancy,
             )
 
-            # Confidence gate
+            # Confidence gate (min_confidence is 0..1 in config)
             if confidence < (self.config["min_confidence"] * 100.0) and ef.quality == "medium":
                 ef.quality = "low"
 
@@ -309,19 +337,18 @@ class AsyncReflektEmotionEngine:
 
             return ef
 
-        except Exception as e:
-            # print(f"Analysis error: {e}")
+        except Exception:
             return self._handle_detection_failure()
 
     # --------------- Public API (Non-blocking) ---------------- #
 
-    def submit_frame(self, frame: np.ndarray) -> bool:
+    def submit_frame(self, frame_bgr: np.ndarray) -> bool:
         """
         Submit frame for analysis (non-blocking).
         Returns True if frame was queued, False if queue full (frame dropped).
         """
         try:
-            self.frame_queue.put_nowait(frame.copy())
+            self.frame_queue.put_nowait(frame_bgr.copy())
             return True
         except queue.Full:
             self.performance_metrics["queue_drops"] += 1
@@ -351,7 +378,7 @@ class AsyncReflektEmotionEngine:
     # --------------- Helper Methods ---------------- #
 
     def compute_valence_arousal(self, emotions: Dict[str, float]) -> Tuple[float, float]:
-        """Convert emotion probabilities to valence/arousal."""
+        """Convert emotion probabilities (0..100) to valence/arousal in [-1..1] and [0..1]."""
         v = sum(
             (float(emotions.get(e, 0.0)) / 100.0) * self.EMOTION_MAPS["valence"][e]
             for e in self.EMOTION_MAPS["valence"]
@@ -383,13 +410,7 @@ class AsyncReflektEmotionEngine:
         avg_a = float(np.mean([e.arousal for e in self.emotion_history]))
         frame.valence = round(avg_v, 3)
         frame.arousal = round(avg_a, 3)
-        
-        # Recompute vibrancy
-        if frame.age is not None:
-            frame.vibrancy = round((frame.arousal ** 0.8) * (1 - (min(frame.age, 70) / 100)), 3)
-        else:
-            frame.vibrancy = round(frame.arousal ** 0.8, 3)
-        
+        frame.vibrancy = round(frame.arousal ** 0.8, 3)
         return frame
 
     def _fuse_modalities(self, frame: EmotionFrame) -> EmotionFrame:
@@ -402,17 +423,11 @@ class AsyncReflektEmotionEngine:
         fused_v = round(wf * frame.valence + wv * self.voice_last["valence"], 3)
         fused_a = round(wf * frame.arousal + wv * self.voice_last["arousal"], 3)
         frame.valence, frame.arousal = fused_v, fused_a
-        
-        # Update vibrancy
-        if frame.age is not None:
-            frame.vibrancy = round((fused_a ** 0.8) * (1 - (min(frame.age, 70) / 100)), 3)
-        else:
-            frame.vibrancy = round(fused_a ** 0.8, 3)
-        
+        frame.vibrancy = round(fused_a ** 0.8, 3)
         return frame
 
     def _handle_detection_failure(self) -> Optional[EmotionFrame]:
-        """Return last valid reading with 'no_face' quality."""
+        """Return last valid reading with 'no_face' quality, else None."""
         if self.last_valid_emotion:
             prev = self.last_valid_emotion
             return EmotionFrame(
@@ -425,7 +440,7 @@ class AsyncReflektEmotionEngine:
                 all_emotions=prev.all_emotions,
                 quality="no_face",
                 processing_time_ms=0.0,
-                age=prev.age,
+                age=None,
                 vibrancy=prev.vibrancy,
             )
         return None
@@ -465,7 +480,6 @@ class AsyncReflektEmotionEngine:
             "avg_processing_ms": round(avg_ms, 2),
             "estimated_analysis_fps": round(est_fps, 1),
             "queue_drops": self.performance_metrics["queue_drops"],
-            "cached_age": self.cached_age,
         }
 
     def export_session(self, filepath: str | None = None, format: str = "json") -> str:
@@ -474,6 +488,8 @@ class AsyncReflektEmotionEngine:
         out_dir.mkdir(exist_ok=True)
         if filepath is None:
             filepath = out_dir / f"session_{self.session_id}.{format}"
+        else:
+            filepath = Path(filepath)
 
         # Summary
         counts: Dict[str, int] = {}
@@ -507,13 +523,13 @@ class AsyncReflektEmotionEngine:
                 w = csv.writer(fh)
                 w.writerow([
                     "timestamp", "frame_number", "dominant", "confidence",
-                    "valence", "arousal", "vibrancy", "age",
+                    "valence", "arousal", "vibrancy",
                     "quality", "processing_time_ms"
                 ])
                 for f in self.session_log:
                     w.writerow([
                         f.timestamp, f.frame_number, f.dominant, f.confidence,
-                        f.valence, f.arousal, f.vibrancy, f.age,
+                        f.valence, f.arousal, f.vibrancy,
                         f.quality, f.processing_time_ms
                     ])
 
@@ -531,10 +547,13 @@ class AsyncReflektEmotionEngine:
         """Gracefully shutdown worker thread."""
         self._worker_running = False
         try:
-            self.frame_queue.put(None, timeout=1.0)
-        except:
+            self.frame_queue.put(None, timeout=0.5)
+        except Exception:
             pass
-        self.worker_thread.join(timeout=2.0)
+        try:
+            self.worker_thread.join(timeout=2.0)
+        except Exception:
+            pass
 
 
 # ============================================================================ #
@@ -560,10 +579,15 @@ class ReflektLiveCapture:
         if not self.cam.isOpened():
             raise RuntimeError(f"Could not open camera {self.camera_index}")
 
+        # Set camera properties for better performance
+        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cam.set(cv2.CAP_PROP_FPS, 30)
+
         print(f"Reflekt Engine started (Session: {self.engine.session_id})")
         print(f"Config: frame_skip={self.engine.config['frame_skip']}, "
               f"smoothing={self.engine.config['smoothing_window']}, "
-              f"backend={self.engine.config['backend']}")
+              f"mtcnn={self.engine.config['mtcnn']}")
         print("Async mode: UI thread never blocks on analysis")
         print("Controls: Q quit | W withdraw/reveal | S archive | M metrics\n")
 
@@ -593,12 +617,14 @@ class ReflektLiveCapture:
 
                 # Submit frame for async analysis (non-blocking)
                 if self.engine.frame_count % self.engine.config["frame_skip"] == 0:
-                    self.engine.submit_frame(frame)
+                    _ = self.engine.submit_frame(frame)
 
-                # Get latest result (non-blocking, always returns immediately)
+                # Get latest result (non-blocking)
                 latest_result = self.engine.get_latest_result()
                 if latest_result:
-                    self.display_emotion = latest_result
+                    # Accept even 'no_face' (so timeline is visible), but overlay shows last valid
+                    if latest_result.quality != "no_face":
+                        self.display_emotion = latest_result
                     self.engine.log_frame(latest_result)
                     print(latest_result.to_json())
 
@@ -656,7 +682,7 @@ class ReflektLiveCapture:
             }
             color = colors.get(emotion.dominant, (255, 255, 255))
 
-            text = f"{emotion.dominant.upper()} ({emotion.confidence}%)"
+            text = f"{emotion.dominant.upper()} ({emotion.confidence:.1f}%)"
             cv2.putText(frame, text, (30, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
 
@@ -668,11 +694,6 @@ class ReflektLiveCapture:
             if vib_text:
                 cv2.putText(frame, vib_text, (30, 120),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220, 220, 220), 2)
-
-            if emotion.age is not None:
-                age_text = f"Age:{emotion.age}"
-                cv2.putText(frame, age_text, (30, 150),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
 
             quality_color = {
                 "high": (0, 255, 0),
@@ -716,9 +737,12 @@ class ReflektLiveCapture:
     def cleanup(self):
         """Cleanup resources and save session."""
         self.running = False
-        if self.cam:
+        if self.cam and self.cam.isOpened():
             self.cam.release()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         
         # Shutdown async engine
         self.engine.shutdown()
@@ -781,28 +805,28 @@ def start_api_server(engine: AsyncReflektEmotionEngine, port: int = 5055):
 
 def main():
     """
-    Main entry point with optimized defaults.
+    Main entry point with optimized defaults for FER.
     """
     # Choose behavior profile
     mode = "fast"  # Options: "fast" | "balanced" | "quality"
     
     presets = {
         "fast": {
-            "frame_skip": 12,
+            "frame_skip": 10,
             "smoothing_window": 4,
-            "backend": "opencv",
+            "mtcnn": False,  # OpenCV is faster
             "min_confidence": 0.25,
         },
         "balanced": {
             "frame_skip": 8,
             "smoothing_window": 5,
-            "backend": "opencv",
+            "mtcnn": False,
             "min_confidence": 0.30,
         },
         "quality": {
-            "frame_skip": 5,
+            "frame_skip": 6,
             "smoothing_window": 6,
-            "backend": "retinaface",
+            "mtcnn": True,  # MTCNN is more accurate (if installed)
             "min_confidence": 0.35,
         },
     }
@@ -812,38 +836,36 @@ def main():
         "serve_api": True,           # Enable REST API
         "api_port": 5055,
         "fusion_weights": {"face": 0.7, "voice": 0.3},
-        "detect_age_once": True,     # Detect age only once at start
-        "enforce_detection": False,
     }
     config.update(presets.get(mode, presets["fast"]))
 
     print("=" * 70)
-    print("  Reflekt Emotion Engine v2.0 - Async Optimized")
+    print("  Reflekt Emotion Engine v2.1 - FER Implementation (fixed)")
     print("=" * 70)
     print(f"  Mode:              {mode.upper()}")
     print(f"  Architecture:      Non-blocking async (worker thread)")
-    print(f"  Backend:           {config['backend']}")
+    print(f"  Backend:           FER (Facial Expression Recognition)")
+    print(f"  Face Detection:    {'MTCNN' if config['mtcnn'] else 'OpenCV Haar Cascade'}")
     print(f"  Frame Skip:        1:{config['frame_skip']}")
     print(f"  Smoothing Window:  {config['smoothing_window']} frames")
-    print(f"  Age Detection:     One-time at session start (cached)")
     print(f"  Min Confidence:    {config['min_confidence']:.0%}")
     print("=" * 70)
     print()
 
     # Create async engine
-    engine = AsyncReflektEmotionEngine(config=config)
+    try:
+        engine = AsyncReflektEmotionEngine(config=config)
+    except Exception as e:
+        print(f"✗ Failed to initialize engine: {e}")
+        return
 
     # OPTIONAL: Voice integration example
-    # If you have a separate voice analysis thread, integrate like this:
-    #
     # def voice_worker():
     #     while True:
     #         valence, arousal = analyze_voice_from_mic()
     #         engine.update_voice(valence=valence, arousal=arousal, dominant="tense")
     #         time.sleep(0.1)
-    #
-    # voice_thread = threading.Thread(target=voice_worker, daemon=True)
-    # voice_thread.start()
+    # threading.Thread(target=voice_worker, daemon=True).start()
 
     # Start REST API (non-blocking)
     if config.get("serve_api", False):
@@ -866,11 +888,13 @@ def main():
         if hasattr(capture, 'running') and capture.running:
             capture.cleanup()
         else:
-            # Manual cleanup if capture didn't start properly
             engine.shutdown()
-            if capture.cam:
+            if capture.cam and capture.cam.isOpened():
                 capture.cam.release()
-            cv2.destroyAllWindows()
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
         print("✓ Shutdown complete")
 
 

@@ -1,0 +1,30 @@
+{
+  "metadata": {
+    "session_id": "20251112_174825",
+    "start_time": 1762949905.6775177,
+    "end_time": 1762950031.7910845,
+    "total_frames": 657,
+    "frames_analyzed": 0,
+    "average_fps": 0.0,
+    "config": {
+      "frame_skip": 12,
+      "smoothing_window": 4,
+      "min_confidence": 0.25,
+      "backend": "opencv",
+      "enforce_detection": false,
+      "use_smoothed_output": true,
+      "serve_api": true,
+      "api_port": 5055,
+      "fusion_weights": {
+        "face": 0.7,
+        "voice": 0.3
+      },
+      "detect_age_once": true
+    },
+    "emotion_summary": {}
+  },
+  "frames": [],
+  "performance": {
+    "status": "no_data"
+  }
+}
