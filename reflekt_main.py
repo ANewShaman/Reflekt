@@ -1,14 +1,8 @@
 """
-Reflekt Main Launcher (v1.0)
-----------------------------
-Launches both the facial (FER) and voice (SER) emotion modules together.
+Reflekt Main Launcher (v1.1 - VOSK Integrated)
+----------------------------------------------
+Launches both facial (FER) and voice (SER via VOSK) emotion modules together.
 Ensures async operation and graceful shutdown.
-"""
-"""
-Reflekt Main Launcher (v1.1 - FIXED)
--------------------------------------
-Launches both facial (FER) and voice (SER) emotion modules together.
-FIXED: Better config handling and error recovery.
 """
 
 import threading
@@ -16,13 +10,13 @@ import time
 import sys
 from reflekt_emotion_live import AsyncReflektEmotionEngine, ReflektLiveCapture, start_api_server
 
-# Try to import voice module (optional)
+# Try to import VOSK-based voice module (optional)
 try:
-    from reflekt_voice_emotion import ReflektVoiceEmotion
+    from reflekt_voice_vosk import ReflektVoiceVOSK
     VOICE_AVAILABLE = True
 except ImportError:
     VOICE_AVAILABLE = False
-    print("⚠ Voice module not available (reflekt_voice_emotion not found)")
+    print("⚠ VOSK voice module not available (reflekt_voice_vosk.py missing)")
 
 
 def main():
@@ -37,11 +31,11 @@ def main():
         "api_port": 5055,
         "use_smoothed_output": True,
         "fusion_weights": {"face": 0.7, "voice": 0.3},
-        "frame_skip": 6,           # FIXED: More frequent processing
+        "frame_skip": 6,
         "smoothing_window": 5,
-        "mtcnn": False,            # Use OpenCV for speed
+        "mtcnn": False,
         "min_confidence": 0.30,
-        "debug": False,            # Set to True for diagnostic output
+        "debug": False,
     }
 
     print("Configuration:")
@@ -67,17 +61,18 @@ def main():
     if config.get("serve_api", False):
         start_api_server(engine, port=config.get("api_port", 5055))
 
-    # Start voice emotion recognition (if available)
+    # Start VOSK voice-recognition module (if available)
     voice_module = None
     voice_thread = None
+
     if VOICE_AVAILABLE:
         try:
-            voice_module = ReflektVoiceEmotion(engine=engine)
+            voice_module = ReflektVoiceVOSK(engine=engine)
             voice_thread = threading.Thread(target=voice_module.start, daemon=True)
             voice_thread.start()
-            print("✓ Voice emotion module started")
+            print("✓ VOSK voice emotion module started")
         except Exception as e:
-            print(f"⚠ Voice module failed to start: {e}")
+            print(f"⚠ VOSK module failed to start: {e}")
             print("  Continuing with facial recognition only...")
             voice_module = None
     
@@ -96,7 +91,7 @@ def main():
         traceback.print_exc()
     finally:
         print("\n✓ Shutting down all modules...")
-        
+
         # Stop voice module
         if voice_module is not None:
             try:
@@ -104,9 +99,8 @@ def main():
                 print("✓ Voice module stopped")
             except Exception as e:
                 print(f"Error stopping voice module: {e}")
-        
-        # Cleanup is handled by capture.cleanup() via finally block
-        print("✓ All modules stopped cleanly.")
+
+        print("All modules stopped cleanly.")
         time.sleep(0.5)
 
 
